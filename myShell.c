@@ -2,7 +2,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -17,6 +19,19 @@ typedef struct {
     char *input_file;
     char *output_file;
 } Redirection;
+
+void sh_errno(const char *ctx) {
+    fprintf(stderr, "sadafa: %s: %s\n", ctx, strerror(errno));
+}
+
+void sh_error(const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "sadafa: ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
 
 void on_sigint(int sig) {
     (void)sig;
@@ -59,8 +74,13 @@ char *read_input(char *buffer, size_t size) {
     size_t len = strlen(buffer);
     if (len > 0 && buffer[len - 1] == '\n') {
         buffer[len - 1] = '\0';
+        return buffer;
     }
 
+    sh_error("input too long (max %zu chars); line discarded", size - 1);
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+    buffer[0] = '\0';
     return buffer;
 }
 
@@ -80,7 +100,7 @@ int builtin_cd(char **argv) {
     if (argv[1] == NULL) {
         target = getenv("HOME");
         if (target == NULL) {
-            fprintf(stderr, "cd: HOME not set\n");
+            sh_error("cd: HOME not set");
             return 1;
         }
     } else {
@@ -88,7 +108,7 @@ int builtin_cd(char **argv) {
     }
 
     if (chdir(target) != 0) {
-        perror("cd");
+        sh_errno("cd");
         return 1;
     }
     return 0;
@@ -97,7 +117,7 @@ int builtin_cd(char **argv) {
 int builtin_pwd(void) {
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        perror("pwd");
+        sh_errno("pwd");
         return 1;
     }
     printf("%s\n", cwd);
@@ -130,13 +150,13 @@ int parse_redirection(Vector *tokens, Redirection *redir) {
 
         if (strcmp(tok, "<") == 0) {
             if (i + 1 >= tokens->size) {
-                fprintf(stderr, "sadafa: syntax error near '<'\n");
+                sh_error("syntax error near '<'");
                 return -1;
             }
             redir->input_file = tokens->data[++i];
         } else if (strcmp(tok, ">") == 0) {
             if (i + 1 >= tokens->size) {
-                fprintf(stderr, "sadafa: syntax error near '>'\n");
+                sh_error("syntax error near '>'");
                 return -1;
             }
             redir->output_file = tokens->data[++i];
@@ -152,19 +172,27 @@ int apply_redirection(Redirection *redir) {
     if (redir->input_file) {
         int fd = open(redir->input_file, O_RDONLY);
         if (fd < 0) {
-            perror(redir->input_file);
+            sh_errno(redir->input_file);
             return -1;
         }
-        dup2(fd, STDIN_FILENO);
+        if (dup2(fd, STDIN_FILENO) < 0) {
+            sh_errno("dup2");
+            close(fd);
+            return -1;
+        }
         close(fd);
     }
     if (redir->output_file) {
         int fd = open(redir->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
-            perror(redir->output_file);
+            sh_errno(redir->output_file);
             return -1;
         }
-        dup2(fd, STDOUT_FILENO);
+        if (dup2(fd, STDOUT_FILENO) < 0) {
+            sh_errno("dup2");
+            close(fd);
+            return -1;
+        }
         close(fd);
     }
     return 0;
@@ -173,7 +201,9 @@ int apply_redirection(Redirection *redir) {
 char *find_in_path(const char *command) {
     if (strchr(command, '/') != NULL) {
         if (access(command, X_OK) == 0) {
-            return strdup(command);
+            char *copy = strdup(command);
+            if (copy == NULL) sh_errno("strdup");
+            return copy;
         }
         return NULL;
     }
@@ -185,6 +215,7 @@ char *find_in_path(const char *command) {
 
     char *path_copy = strdup(path_env);
     if (path_copy == NULL) {
+        sh_errno("strdup");
         return NULL;
     }
 
@@ -195,6 +226,7 @@ char *find_in_path(const char *command) {
 
         if (access(candidate, X_OK) == 0) {
             char *result = strdup(candidate);
+            if (result == NULL) sh_errno("strdup");
             free(path_copy);
             return result;
         }
@@ -212,13 +244,13 @@ int split_pipeline(Vector *tokens, Vector stages[], int max_stages) {
     for (int i = 0; i < tokens->size; i++) {
         if (strcmp(tokens->data[i], "|") == 0) {
             if (stages[count].size == 0) {
-                fprintf(stderr, "sadafa: syntax error near '|'\n");
+                sh_error("syntax error near '|'");
                 for (int j = 0; j <= count; j++) vector_free(&stages[j]);
                 return -1;
             }
             count++;
             if (count >= max_stages) {
-                fprintf(stderr, "sadafa: too many pipe stages\n");
+                sh_error("too many pipe stages (max %d)", max_stages);
                 for (int j = 0; j < count; j++) vector_free(&stages[j]);
                 return -1;
             }
@@ -229,7 +261,7 @@ int split_pipeline(Vector *tokens, Vector stages[], int max_stages) {
     }
 
     if (stages[count].size == 0) {
-        fprintf(stderr, "sadafa: syntax error near '|'\n");
+        sh_error("syntax error near '|'");
         for (int j = 0; j <= count; j++) vector_free(&stages[j]);
         return -1;
     }
@@ -248,11 +280,11 @@ void run_child_command(Vector *stage, Vector *history) {
 
     char *path = find_in_path(argv[0]);
     if (path == NULL) {
-        fprintf(stderr, "sadafa: %s: command not found\n", argv[0]);
+        sh_error("%s: command not found", argv[0]);
         exit(127);
     }
     execv(path, argv);
-    perror("execv");
+    sh_errno(argv[0]);
     exit(127);
 }
 
@@ -267,7 +299,7 @@ int execute_pipeline(Vector stages[], int num_stages, Redirection *redir,
 
         if (!is_last) {
             if (pipe(fds) < 0) {
-                perror("pipe");
+                sh_errno("pipe");
                 if (prev_read != -1) close(prev_read);
                 return -1;
             }
@@ -275,7 +307,7 @@ int execute_pipeline(Vector stages[], int num_stages, Redirection *redir,
 
         pid_t pid = fork();
         if (pid < 0) {
-            perror("fork");
+            sh_errno("fork");
             if (prev_read != -1) close(prev_read);
             if (!is_last) { close(fds[0]); close(fds[1]); }
             return -1;
@@ -376,7 +408,7 @@ int execute_command(Vector *tokens, Vector *history) {
     }
 
     if (tokens->size == 0) {
-        fprintf(stderr, "sadafa: syntax error: no command\n");
+        sh_error("syntax error: no command");
         return -1;
     }
 
@@ -409,7 +441,7 @@ int execute_command(Vector *tokens, Vector *history) {
     pid_t pid = fork();
 
     if (pid < 0) {
-        perror("fork");
+        sh_errno("fork");
         return -1;
     }
 
@@ -424,12 +456,12 @@ int execute_command(Vector *tokens, Vector *history) {
 
         char *path = find_in_path(argv[0]);
         if (path == NULL) {
-            fprintf(stderr, "sadafa: %s: command not found\n", argv[0]);
+            sh_error("%s: command not found", argv[0]);
             exit(127);
         }
 
         execv(path, argv);
-        perror("execv");
+        sh_errno(argv[0]);
         free(path);
         exit(127);
     }
@@ -441,7 +473,7 @@ int execute_command(Vector *tokens, Vector *history) {
 
     int status;
     if (waitpid(pid, &status, 0) < 0) {
-        perror("waitpid");
+        sh_errno("waitpid");
         return -1;
     }
 

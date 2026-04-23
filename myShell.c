@@ -20,11 +20,11 @@ typedef struct {
     char *output_file;
 } Redirection;
 
-void sh_errno(const char *ctx) {
+static void sh_errno(const char *ctx) {
     fprintf(stderr, "sadafa: %s: %s\n", ctx, strerror(errno));
 }
 
-void sh_error(const char *fmt, ...) {
+static void sh_error(const char *fmt, ...) {
     va_list ap;
     fprintf(stderr, "sadafa: ");
     va_start(ap, fmt);
@@ -33,13 +33,13 @@ void sh_error(const char *fmt, ...) {
     fprintf(stderr, "\n");
 }
 
-void on_sigint(int sig) {
+static void on_sigint(int sig) {
     (void)sig;
     write(STDOUT_FILENO, "\n", 1);
     write(STDOUT_FILENO, "sadafa> ", 8);
 }
 
-void setup_shell_signals(void) {
+static void setup_shell_signals(void) {
     struct sigaction sa_int;
     sa_int.sa_handler = on_sigint;
     sigemptyset(&sa_int.sa_mask);
@@ -53,7 +53,7 @@ void setup_shell_signals(void) {
     sigaction(SIGTSTP, &sa_ign, NULL);
 }
 
-void reset_foreground_child_signals(void) {
+static void reset_foreground_child_signals(void) {
     struct sigaction sa_dfl;
     sa_dfl.sa_handler = SIG_DFL;
     sigemptyset(&sa_dfl.sa_mask);
@@ -61,12 +61,12 @@ void reset_foreground_child_signals(void) {
     sigaction(SIGINT, &sa_dfl, NULL);
 }
 
-void print_prompt(void) {
+static void print_prompt(void) {
     printf("sadafa> ");
     fflush(stdout);
 }
 
-char *read_input(char *buffer, size_t size) {
+static char *read_input(char *buffer, size_t size) {
     if (fgets(buffer, (int)size, stdin) == NULL) {
         return NULL;
     }
@@ -84,7 +84,7 @@ char *read_input(char *buffer, size_t size) {
     return buffer;
 }
 
-void tokenize(char *input, Vector *tokens) {
+static void tokenize(char *input, Vector *tokens) {
     vector_clear(tokens);
 
     char *token = strtok(input, TOKEN_DELIMITERS);
@@ -94,7 +94,7 @@ void tokenize(char *input, Vector *tokens) {
     }
 }
 
-int builtin_cd(char **argv) {
+static int builtin_cd(char **argv) {
     const char *target;
 
     if (argv[1] == NULL) {
@@ -114,7 +114,7 @@ int builtin_cd(char **argv) {
     return 0;
 }
 
-int builtin_pwd(void) {
+static int builtin_pwd(void) {
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
         sh_errno("pwd");
@@ -124,7 +124,7 @@ int builtin_pwd(void) {
     return 0;
 }
 
-int builtin_echo(char **argv) {
+static int builtin_echo(char **argv) {
     for (int i = 1; argv[i] != NULL; i++) {
         if (i > 1) printf(" ");
         printf("%s", argv[i]);
@@ -133,14 +133,42 @@ int builtin_echo(char **argv) {
     return 0;
 }
 
-int builtin_history(Vector *history) {
+static int builtin_history(Vector *history) {
     for (int i = 0; i < history->size; i++) {
         printf("%5d  %s\n", i + 1, history->data[i]);
     }
     return 0;
 }
 
-int parse_redirection(Vector *tokens, Redirection *redir) {
+typedef int (*BuiltinFn)(char **argv, Vector *history);
+
+typedef struct {
+    const char *name;
+    BuiltinFn fn;
+} BuiltinCommand;
+
+static int builtin_cd_cmd(char **argv, Vector *history) {
+    (void)history;
+    return builtin_cd(argv);
+}
+
+static int builtin_pwd_cmd(char **argv, Vector *history) {
+    (void)argv;
+    (void)history;
+    return builtin_pwd();
+}
+
+static int builtin_echo_cmd(char **argv, Vector *history) {
+    (void)history;
+    return builtin_echo(argv);
+}
+
+static int builtin_history_cmd(char **argv, Vector *history) {
+    (void)argv;
+    return builtin_history(history);
+}
+
+static int parse_redirection(Vector *tokens, Redirection *redir) {
     redir->input_file = NULL;
     redir->output_file = NULL;
 
@@ -168,7 +196,7 @@ int parse_redirection(Vector *tokens, Redirection *redir) {
     return 0;
 }
 
-int apply_redirection(Redirection *redir) {
+static int apply_redirection(Redirection *redir) {
     if (redir->input_file) {
         int fd = open(redir->input_file, O_RDONLY);
         if (fd < 0) {
@@ -198,7 +226,54 @@ int apply_redirection(Redirection *redir) {
     return 0;
 }
 
-char *find_in_path(const char *command) {
+static int run_builtin_with_redirection(BuiltinFn builtin_fn, char **argv, Vector *history, Redirection *redir) {
+    int saved_stdin = -1;
+    int saved_stdout = -1;
+    int rc;
+
+    if (redir->input_file || redir->output_file) {
+        saved_stdin = dup(STDIN_FILENO);
+        if (saved_stdin < 0) {
+            sh_errno("dup");
+            return -1;
+        }
+        saved_stdout = dup(STDOUT_FILENO);
+        if (saved_stdout < 0) {
+            sh_errno("dup");
+            close(saved_stdin);
+            return -1;
+        }
+        if (apply_redirection(redir) < 0) {
+            dup2(saved_stdin, STDIN_FILENO);
+            dup2(saved_stdout, STDOUT_FILENO);
+            close(saved_stdin);
+            close(saved_stdout);
+            return -1;
+        }
+    }
+
+    rc = builtin_fn(argv, history);
+    fflush(stdout);
+
+    if (saved_stdin >= 0) {
+        if (dup2(saved_stdin, STDIN_FILENO) < 0) {
+            sh_errno("dup2");
+            rc = -1;
+        }
+        close(saved_stdin);
+    }
+    if (saved_stdout >= 0) {
+        if (dup2(saved_stdout, STDOUT_FILENO) < 0) {
+            sh_errno("dup2");
+            rc = -1;
+        }
+        close(saved_stdout);
+    }
+
+    return rc;
+}
+
+static char *find_in_path(const char *command) {
     if (strchr(command, '/') != NULL) {
         if (access(command, X_OK) == 0) {
             char *copy = strdup(command);
@@ -237,7 +312,7 @@ char *find_in_path(const char *command) {
     return NULL;
 }
 
-int split_pipeline(Vector *tokens, Vector stages[], int max_stages) {
+static int split_pipeline(Vector *tokens, Vector stages[], int max_stages) {
     int count = 0;
     vector_init(&stages[0]);
 
@@ -269,7 +344,7 @@ int split_pipeline(Vector *tokens, Vector stages[], int max_stages) {
     return count + 1;
 }
 
-void run_child_command(Vector *stage, Vector *history) {
+static void run_child_command(Vector *stage, Vector *history) {
     char **argv = vector_to_argv(stage);
 
     if (strcmp(argv[0], "cd") == 0)      exit(0);
@@ -285,10 +360,11 @@ void run_child_command(Vector *stage, Vector *history) {
     }
     execv(path, argv);
     sh_errno(argv[0]);
+    free(path);
     exit(127);
 }
 
-int execute_pipeline(Vector stages[], int num_stages, Redirection *redir,
+static int execute_pipeline(Vector stages[], int num_stages, Redirection *redir,
                      int background, Vector *history) {
     int prev_read = -1;
     pid_t pids[MAX_STAGES];
@@ -358,7 +434,7 @@ int execute_pipeline(Vector stages[], int num_stages, Redirection *redir,
     return 0;
 }
 
-void reap_background_jobs(void) {
+static void reap_background_jobs(void) {
     pid_t done;
     int status;
     while ((done = waitpid(-1, &status, WNOHANG)) > 0) {
@@ -370,7 +446,7 @@ void reap_background_jobs(void) {
     }
 }
 
-void builtin_exit(Vector *tokens, Vector *history) {
+static void builtin_exit(Vector *tokens, Vector *history) {
     int code = 0;
     if (tokens->size > 1) {
         code = atoi(tokens->data[1]);
@@ -384,7 +460,15 @@ void builtin_exit(Vector *tokens, Vector *history) {
     exit(code);
 }
 
-int execute_command(Vector *tokens, Vector *history) {
+static int execute_command(Vector *tokens, Vector *history) {
+    static const BuiltinCommand builtins[] = {
+        {"cd", builtin_cd_cmd},
+        {"pwd", builtin_pwd_cmd},
+        {"echo", builtin_echo_cmd},
+        {"history", builtin_history_cmd},
+        {NULL, NULL}
+    };
+
     if (tokens->size == 0) {
         return 0;
     }
@@ -433,10 +517,11 @@ int execute_command(Vector *tokens, Vector *history) {
 
     char **argv = vector_to_argv(tokens);
 
-    if (strcmp(argv[0], "cd") == 0)      return builtin_cd(argv);
-    if (strcmp(argv[0], "pwd") == 0)     return builtin_pwd();
-    if (strcmp(argv[0], "echo") == 0)    return builtin_echo(argv);
-    if (strcmp(argv[0], "history") == 0) return builtin_history(history);
+    for (int i = 0; builtins[i].name != NULL; i++) {
+        if (strcmp(argv[0], builtins[i].name) == 0) {
+            return run_builtin_with_redirection(builtins[i].fn, argv, history, &redir);
+        }
+    }
 
     pid_t pid = fork();
 
@@ -503,7 +588,12 @@ int main(void) {
             continue;
         }
 
-        vector_push(&history, strdup(input));
+        char *history_entry = strdup(input);
+        if (history_entry == NULL) {
+            sh_errno("strdup");
+        } else {
+            vector_push(&history, history_entry);
+        }
 
         tokenize(input, &tokens);
 

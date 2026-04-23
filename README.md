@@ -11,6 +11,7 @@ Under the hood it uses `fork`, `execv`, pipes, file descriptors, and
 - Runs external programs by searching `$PATH` manually (`execv`, not `execvp`)
 - Built-ins: `cd`, `pwd`, `echo`, `history`, `exit`
 - Input/output redirection with `<` and `>`
+- Redirection works with both external commands and built-ins
 - Pipes between commands, as many stages as you want (`ls | grep .c | wc -l`)
 - Background jobs with `&`, and it tells you when they finish
 - Ctrl+C kills the running command but not the shell
